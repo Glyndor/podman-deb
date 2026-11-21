@@ -58,6 +58,7 @@ jobs:
       podman_sha: ${{ steps.p.outputs.podman_sha }}
       netavark_sha: ${{ steps.p.outputs.netavark_sha }}
       aardvark_sha: ${{ steps.p.outputs.aardvark_sha }}
+      previous_mldsa: ${{ steps.p.outputs.previous_mldsa }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,8 +81,14 @@ jobs:
           # releases would one day miss the revision the planner has to step past.
           git ls-remote --tags "https://github.com/$GH_REPO.git" \
             | sed 's#.*refs/tags/##; s#\^{}$##' | sort -u > "$w/tags"
-          bash scripts/upstream/read-released.sh "$w/released"
+          bash scripts/upstream/read-released.sh "$w/released" "$w/assets"
           bash scripts/upstream/plan-release.sh "$w/fresh" "$w/released" "$w/tags" >> "$GITHUB_OUTPUT"
+          # Whether the newest release carries the second signature. From the first
+          # release that does, the signing step refuses to publish one without it.
+          [ -f "$w/assets" ] || { echo "the asset list of the newest release was not written" >&2; exit 1; }
+          previous_mldsa=false
+          if grep -q '\.mldsa65\.sig$' "$w/assets"; then previous_mldsa=true; fi
+          echo "previous_mldsa=$previous_mldsa" >> "$GITHUB_OUTPUT"
           # The package version is the tag without its leading v; the build
           # workflow takes it as given, since an expression cannot strip it.
           tag="$(sed -n 's/^tag=//p' "$GITHUB_OUTPUT")"
@@ -152,6 +159,7 @@ jobs:
       NETAVARK: ${{ needs.plan.outputs.netavark }}
       AARDVARK: ${{ needs.plan.outputs.aardvark }}
       RECIPE: ${{ needs.plan.outputs.recipe }}
+      PREVIOUS_MLDSA: ${{ needs.plan.outputs.previous_mldsa }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -189,6 +197,19 @@ jobs:
           # a signature nobody can check is refused. With neither, the check is the
           # Ed25519 one the release always had. Set the secret and merge the key one
           # after the other: a release built between the two stops, whichever came first.
+          #
+          # The committed key is one half; the other is what was already published. Once
+          # the newest release carries an ML-DSA-65 signature, this one must too, so an
+          # anchor emptied by a bad merge, a checkout or an editor stops the run instead
+          # of quietly going back to Ed25519 alone. A rotation adds the new key before
+          # it removes the old one, so the anchor never empties and nothing here stops
+          # it. Retiring the second signature on purpose cannot be told from an accident
+          # by this step, so there is no switch for it: it takes a reviewed change to
+          # this rule, in the pull request that empties the anchor, saying why.
+          case "$PREVIOUS_MLDSA" in
+            true | false) ;;
+            *) echo "::error::the plan did not say whether the newest release carries the second signature ('$PREVIOUS_MLDSA'); refusing to guess."; exit 1 ;;
+          esac
           anchor="$GITHUB_WORKSPACE/keyring/glyndor-release-mldsa65.b64"
           [ -f "$anchor" ] || { echo "::error::$anchor is missing; refusing to publish without knowing whether the second signature is required."; exit 1; }
           # This step and verify-sig.py both decide what a line of that file is. The
@@ -196,20 +217,27 @@ jobs:
           # feed alone, so a key behind a carriage return would be part of a comment
           # here and a key there, and the run would publish one signature under an
           # anchor that holds a key. The file is printable ASCII with line feeds, where
-          # the two readers agree, or the run stops.
-          if LC_ALL=C grep -q '[^ -~]' "$anchor"; then
+          # the two readers agree, or the run stops. The bytes are counted, not
+          # matched line by line: GNU grep reads a file with a NUL in it as binary and
+          # reports no match, which let such a file through as text.
+          outside="$(LC_ALL=C tr -d ' -~\n' < "$anchor" | wc -c)"
+          if [ "$outside" -ne 0 ]; then
             echo "::error::keyring/glyndor-release-mldsa65.b64 holds a byte that is neither printable ASCII nor a line feed; refusing to guess whether it holds a key."
             exit 1
           fi
           anchored=false
           if grep -q -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$anchor"; then anchored=true; fi
+          if [ "$PREVIOUS_MLDSA" = true ] && [ "$anchored" = false ]; then
+            echo "::error::the newest release carries an ML-DSA-65 signature and keyring/glyndor-release-mldsa65.b64 holds no key; refusing to publish this one with Ed25519 alone."
+            exit 1
+          fi
           if [ "$anchored" = true ] && [ -z "$GLYNDOR_RELEASE_MLDSA65_KEY" ]; then
             echo "::error::keyring/glyndor-release-mldsa65.b64 holds a public key and GLYNDOR_RELEASE_MLDSA65_KEY is not configured; refusing to publish with one signature."
             exit 1
           fi
           required=false
           require=()
-          if [ -n "$GLYNDOR_RELEASE_MLDSA65_KEY" ]; then
+          if [ -n "$GLYNDOR_RELEASE_MLDSA65_KEY" ] || [ "$PREVIOUS_MLDSA" = true ]; then
             required=true
             require=(--require-mldsa)
           fi

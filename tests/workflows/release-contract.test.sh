@@ -67,6 +67,15 @@ elif rule == "attest":
         create = [n for n, s in enumerate(steps) if s.get("name") == "Create the release"]
         if not signing or not create or not (signing[0] < i < create[0]):
             print("the attestation is not between signing and the release")
+elif rule == "previous":
+    # What the plan read about the newest release reaches the signing step as it was
+    # read: a literal there would decide the downgrade rule for every run.
+    want = "${{ steps.p.outputs.previous_mldsa }}"
+    if str((jobs["plan"].get("outputs") or {}).get("previous_mldsa", "")) != want:
+        print(f"plan does not hand on previous_mldsa as {want}")
+    want = "${{ needs.plan.outputs.previous_mldsa }}"
+    if str((jobs["publish"].get("env") or {}).get("PREVIOUS_MLDSA", "")) != want:
+        print(f"publish does not take PREVIOUS_MLDSA from {want}")
 PY
 }
 
@@ -115,6 +124,15 @@ sabotage release.yml "      attestations: write
 " "" "$BAD" >/dev/null 2>&1
 check "a job that cannot write the attestation is named" "publish lacks attestations: write, which the attestation needs" "$(violations attest "$BAD")"
 
+# --- what the plan read about the newest release reaches the signing step ---------
+check "previous_mldsa goes from the plan to the signing step untouched" "" "$(violations previous)"
+sabotage release.yml "PREVIOUS_MLDSA: \${{ needs.plan.outputs.previous_mldsa }}" "PREVIOUS_MLDSA: false" "$BAD" >/dev/null 2>&1
+check "a literal in its place is named" "publish does not take PREVIOUS_MLDSA from \${{ needs.plan.outputs.previous_mldsa }}" \
+	"$(violations previous "$BAD")"
+sabotage release.yml "previous_mldsa: \${{ steps.p.outputs.previous_mldsa }}" "previous_mldsa: 'false'" "$BAD" >/dev/null 2>&1
+check "and so is one in the plan's outputs" "plan does not hand on previous_mldsa as \${{ steps.p.outputs.previous_mldsa }}" \
+	"$(violations previous "$BAD")"
+
 # --- release.yml, publish: the step that signs, and the second signature ----------
 # It is found by the secret it holds, and the other secret is given to it as the case
 # needs. A python3 that makes a virtual environment whose python only writes down
@@ -138,7 +156,8 @@ PY
 	WS="$S/ws"
 	ANCHOR="$WS/keyring/glyndor-release-mldsa65.b64"
 	REL="$WS/.github/scripts/release"
-	sign() { # <anchor: empty|keyed|missing|indented|committed|cr|crlf|bom|tab> <mldsa secret, may be empty>
+	# The third argument is what the plan said about the newest release, false by default.
+	sign() { # <anchor: empty|keyed|missing|indented|committed|cr|crlf|bom|tab|nul|high> <mldsa secret, may be empty> [previous]
 		rm -rf "$S/art" "$S/rt" "$WS" "$S/calls" "$S/out"; mkdir -p "$S/art" "$WS/keyring"
 		: > "$S/calls"; : > "$S/out"
 		touch "$S/art/podman_6.2.0_arch1.deb" "$S/art/podman_6.2.0_arch2.deb"
@@ -153,10 +172,14 @@ PY
 			crlf) printf '# Glyndor release ML-DSA-65 public keys.\r\nAAAAAAAAAAAAAAAA\r\n' > "$ANCHOR" ;;
 			bom) printf '\357\273\277# Glyndor release ML-DSA-65 public keys.\n' > "$ANCHOR" ;;
 			tab) printf '# Glyndor release ML-DSA-65 public keys.\n\t# a comment behind a tab\n' > "$ANCHOR" ;;
+			# A NUL makes GNU grep read the file as binary, where its pattern matches
+			# nothing, so a guard that matched lines let this one through.
+			nul) printf '# Glyndor release ML-DSA-65 public keys.\000# behind a NUL\n' > "$ANCHOR" ;;
+			high) printf '# Glyndor release ML-DSA-65 public keys.\n# \200 a byte past ASCII\n' > "$ANCHOR" ;;
 		esac
 		run_step "$S" "$S/art" PATH="$S/bin:$PATH" RUNNER_TEMP="$S/rt" GITHUB_WORKSPACE="$WS" \
 			GITHUB_OUTPUT="$S/out" CALLS="$S/calls" FAKE_PYTHON="$S/venv-python" \
-			GLYNDOR_RELEASE_ED25519_KEY=an-ed25519-seed GLYNDOR_RELEASE_MLDSA65_KEY="$2"
+			GLYNDOR_RELEASE_ED25519_KEY=an-ed25519-seed GLYNDOR_RELEASE_MLDSA65_KEY="$2" PREVIOUS_MLDSA="${3-false}"
 	}
 	verify_line() { # <deb> [--require-mldsa]: the call the step must make for a package
 		printf '%s/verify-sig.py %s %s.sig %s/keyring/glyndor-release-ed25519.b64 --mldsa-sig %s.mldsa65.sig --mldsa-keys %s%s' \
@@ -174,6 +197,11 @@ PY
 	done
 	sign keyed AAAA-a-seed
 	check "a committed key and the secret: the packages go through" "0" "$rc"
+	# The only install in the job that holds the signing keys: pinned by hash and binary
+	# only, so no sdist builds and no tree is resolved beside the keys.
+	check "and first the signing library is installed by hash, binary only, from sign-requirements.txt" "1 -m pip install" \
+		"$(calls "-m pip install --quiet --require-hashes --only-binary=:all: -r $REL/sign-requirements.txt") $(head -n 1 "$S/calls" | cut -d' ' -f1-3)"
+	check "and nothing else is installed" 1 "$(grep -c 'pip install' "$S/calls")"
 	check "and each package is verified against the anchor with the second signature required" \
 		"1 1" "$(calls "$(verify_line podman_6.2.0_arch1.deb --require-mldsa)") $(calls "$(verify_line podman_6.2.0_arch2.deb --require-mldsa)")"
 	check "and the release is told it is required" 1 "$(grep -c -x require_mldsa=true "$S/out")"
@@ -190,11 +218,32 @@ PY
 	check "the anchor this repository commits, no secret: the packages go through" "0 2" "$rc $(signed)"
 	# A carriage return is a line break to the verifier and not to this step, so a
 	# key behind one would be a comment here and required of nobody.
-	for state in cr crlf bom tab; do
+	for state in cr crlf bom tab nul high; do
 		sign "$state" ""
 		check "an anchor with a byte outside printable ASCII and the line feed ($state), no secret: refused" "1" "$rc"
 		check "$state: and it says which file and why" 1 "$(says 'holds a byte that is neither printable ASCII nor a line feed')"
 		check "$state: and nothing is signed" 0 "$(signed)"
+	done
+	# --- once a release carries the second signature, the next one cannot drop it ---
+	downgrade='the newest release carries an ML-DSA-65 signature and keyring/glyndor-release-mldsa65.b64 holds no key'
+	for secret in "" a-seed; do
+		sign empty "$secret" true
+		check "the newest release signed twice, an emptied anchor, secret '${secret:-unset}': refused" "1" "$rc"
+		check "and it says the anchor lost the key the last release was verified with" 1 "$(says "$downgrade")"
+		check "and nothing is signed" 0 "$(signed)"
+	done
+	sign committed "" true
+	check "the anchor as committed today, after a release signed twice: refused for the downgrade" "1 1" "$rc $(says "$downgrade")"
+	sign keyed a-seed true
+	check "the newest release signed twice, a key and the secret: the packages go through, both required" "0 1 1" \
+		"$rc $(calls "$(verify_line podman_6.2.0_arch1.deb --require-mldsa)") $(grep -c -x require_mldsa=true "$S/out")"
+	sign keyed "" true
+	check "the newest release signed twice, a key and no secret: refused for the secret" "1 1 0" \
+		"$rc $(says 'GLYNDOR_RELEASE_MLDSA65_KEY is not configured') $(says "$downgrade")"
+	for previous in "" yes; do
+		sign empty "" "$previous"
+		check "a plan that says '${previous:-nothing}' about the newest release: refused, not read as no" "1 1 0" \
+			"$rc $(says 'the plan did not say whether the newest release carries the second signature') $(signed)"
 	done
 	sign missing ""
 	check "no anchor file at all: refused, not read as no key" "1" "$rc"
